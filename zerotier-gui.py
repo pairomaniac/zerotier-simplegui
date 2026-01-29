@@ -7,7 +7,7 @@ import time
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.0.0"
+VERSION = "1.5.0"
 DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-zerotier-gaming"
 CMD_TIMEOUT = 5
 
@@ -191,9 +191,9 @@ class ZerotierGUI(Gtk.Application):
         if fw == "firewalld":
             lines.append('firewall-cmd --zone=trusted --add-interface="$IFACE" 2>/dev/null || true')
         elif fw == "ufw":
-            lines.append('ufw allow in on "$IFACE" 2>/dev/null || true')
-            lines.append('ufw allow out on "$IFACE" 2>/dev/null || true')
-        
+            lines.append('ufw allow in on zt+ 2>/dev/null || true')
+            lines.append('ufw allow out on zt+ 2>/dev/null || true')
+
         try:
             with open(DISPATCHER_PATH, 'w') as f:
                 f.write('\n'.join(lines) + '\n')
@@ -260,21 +260,23 @@ class ZerotierGUI(Gtk.Application):
             return
         active = check.get_active()
         route_active = self.route_check.get_active()
-        
+
         def work():
             self.write_dispatcher(route_active, self.fw_type if active else None)
-            if self.fw_type:
+            
+            if self.fw_type == "firewalld":
                 for iface in self.get_zt_ifaces():
-                    if self.fw_type == "firewalld":
-                        action = '--add-interface' if active else '--remove-interface'
-                        self.cmd('firewall-cmd', '--zone=trusted', f'{action}={iface}')
-                    elif self.fw_type == "ufw":
-                        for direction in ['in', 'out']:
-                            if active:
-                                self.cmd('ufw', 'allow', direction, 'on', iface)
-                            else:
-                                self.cmd('ufw', 'delete', 'allow', direction, 'on', iface)
-        
+                    action = '--add-interface' if active else '--remove-interface'
+                    self.cmd('firewall-cmd', '--zone=trusted', f'{action}={iface}')
+                    
+            elif self.fw_type == "ufw":
+                if active:
+                    self.cmd('ufw', 'allow', 'in', 'on', 'zt+')
+                    self.cmd('ufw', 'allow', 'out', 'on', 'zt+')
+                else:
+                    self.cmd('ufw', 'delete', 'allow', 'in', 'on', 'zt+')
+                    self.cmd('ufw', 'delete', 'allow', 'out', 'on', 'zt+')
+
         self._run_async('updating firewall...', work)
 
     def on_enable_toggled(self, check):
