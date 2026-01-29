@@ -290,7 +290,7 @@ class ZerotierGUI(Gtk.Application):
         if self.busy or not self.has_systemd:
             return
         
-        self.set_busy(True, f'{action}ing...')
+        self.set_busy(True, {"stop":"stopping"}.get(action, f'{action}ing') + '...')
         expect_active = action in ('start', 'restart')
         
         def work():
