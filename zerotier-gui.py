@@ -7,7 +7,7 @@ import time
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.5.0"
+VERSION = "1.0.0"
 DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-zerotier-gaming"
 CMD_TIMEOUT = 5
 
