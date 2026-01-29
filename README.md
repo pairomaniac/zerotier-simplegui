@@ -1,4 +1,4 @@
-# ZeroTier GUI
+# ZeroTier SimpleGUI
 
 A lightweight GTK4 interface for managing ZeroTier networks on Linux, with some gaming-focused niceties and a minimalistic look.
 
