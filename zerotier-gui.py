@@ -124,12 +124,12 @@ class ZerotierGUI(Gtk.Application):
         while child := box.get_first_child():
             box.remove(child)
 
-    def get_zt_iface(self):
-        """Get ZeroTier interface name from /sys/class/net."""
+    def get_zt_ifaces(self):
+        """Get all ZeroTier interface names from /sys/class/net."""
         try:
-            return next((e for e in os.listdir('/sys/class/net') if e.startswith('zt')), None)
+            return [e for e in os.listdir('/sys/class/net') if e.startswith('zt')]
         except OSError:
-            return None
+            return []
 
     def get_service_info(self):
         """Get service state and enabled status in one systemctl call.
@@ -187,7 +187,7 @@ class ZerotierGUI(Gtk.Application):
             '[[ ! "$IFACE" =~ ^zt[a-z0-9]+$ || "$ACTION" != "up" ]] && exit 0'
         ]
         if route:
-            lines.append('ip route add 255.255.255.255/32 dev "$IFACE" 2>/dev/null || true')
+            lines.append('ip route replace 255.255.255.255/32 dev "$IFACE" 2>/dev/null || true')
         if fw == "firewalld":
             lines.append('firewall-cmd --zone=trusted --add-interface="$IFACE" 2>/dev/null || true')
         elif fw == "ufw":
@@ -249,8 +249,8 @@ class ZerotierGUI(Gtk.Application):
         
         def work():
             self.write_dispatcher(active, self.fw_type if fw_active else None)
-            if iface := self.get_zt_iface():
-                action = 'add' if active else 'del'
+            action = 'add' if active else 'del'
+            for iface in self.get_zt_ifaces():
                 self.cmd('ip', 'route', action, '255.255.255.255/32', 'dev', iface)
         
         self._run_async('updating route...', work)
@@ -263,17 +263,17 @@ class ZerotierGUI(Gtk.Application):
         
         def work():
             self.write_dispatcher(route_active, self.fw_type if active else None)
-            iface = self.get_zt_iface()
-            if iface and self.fw_type:
-                if self.fw_type == "firewalld":
-                    action = '--add-interface' if active else '--remove-interface'
-                    self.cmd('firewall-cmd', '--zone=trusted', f'{action}={iface}')
-                elif self.fw_type == "ufw":
-                    for direction in ['in', 'out']:
-                        if active:
-                            self.cmd('ufw', 'allow', direction, 'on', iface)
-                        else:
-                            self.cmd('ufw', 'delete', 'allow', direction, 'on', iface)
+            if self.fw_type:
+                for iface in self.get_zt_ifaces():
+                    if self.fw_type == "firewalld":
+                        action = '--add-interface' if active else '--remove-interface'
+                        self.cmd('firewall-cmd', '--zone=trusted', f'{action}={iface}')
+                    elif self.fw_type == "ufw":
+                        for direction in ['in', 'out']:
+                            if active:
+                                self.cmd('ufw', 'allow', direction, 'on', iface)
+                            else:
+                                self.cmd('ufw', 'delete', 'allow', direction, 'on', iface)
         
         self._run_async('updating firewall...', work)
 
@@ -288,8 +288,7 @@ class ZerotierGUI(Gtk.Application):
         if self.busy or not self.has_systemd:
             return
         
-        status_text = {'start': 'starting...', 'stop': 'stopping...', 'restart': 'restarting...'}
-        self.set_busy(True, status_text[action])
+        self.set_busy(True, f'{action}ing...')
         expect_active = action in ('start', 'restart')
         
         def work():
