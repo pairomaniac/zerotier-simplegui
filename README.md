@@ -2,6 +2,8 @@
 
 A lightweight GTK4 interface for managing ZeroTier networks on Linux, with some gaming-focused niceties and a minimalistic look.
 
+<img width="307" height="367" alt="zt-gaming" src="https://github.com/user-attachments/assets/3a9f6b17-b62e-4777-9d79-ae85648f0b51" />
+
 ## Features
 
 - View and manage ZeroTier networks
