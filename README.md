@@ -95,7 +95,7 @@ Options:
 
 ### Broadcast Route
 
-Enables LAN game discovery over ZeroTier by adding a broadcast route (`255.255.255.255/32`) to the ZeroTier interface. Required for games that use broadcast packets for server discovery.
+Enables LAN game discovery over ZeroTier by adding a broadcast route (`255.255.255.255/32`) to the first ZeroTier interface. Required for games that use broadcast packets for server discovery.
 
 ### Trusted Firewall Zone
 
