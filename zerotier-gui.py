@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """ZeroTier GUI - A GTK4 interface for managing ZeroTier networks."""
 import os
+import re
 import sys
 import subprocess
 import time
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-zerotier-gaming"
 CMD_TIMEOUT = 5
 
-# Whitelisted environment variables that can be passed through pkexec
-ALLOWED_ENV = frozenset({
-    'DISPLAY', 'WAYLAND_DISPLAY', 'USER_HOME',
-    'GTK_A11Y', 'GTK_USE_PORTAL', 'GTK_THEME'
-})
+# Validators for environment variables passed through pkexec (also serves as whitelist)
+ENV_VALIDATORS = {
+    'DISPLAY': re.compile(r'^:[0-9]+(\.[0-9]+)?$'),
+    'WAYLAND_DISPLAY': re.compile(r'^(/[a-zA-Z0-9/_.-]+|wayland-[0-9]+)$'),
+    'USER_HOME': re.compile(r'^/[a-zA-Z0-9/_.-]+$'),
+    'GTK_THEME': re.compile(r'^[A-Za-z0-9_:.-]+$'),
+    'GTK_A11Y': re.compile(r'^[a-z]+$'),
+    'GTK_USE_PORTAL': re.compile(r'^[01]$'),
+}
 
 STATUS_COLORS = {
     'OK': '#2ecc71',
@@ -79,11 +84,12 @@ if os.geteuid() != 0:
     
     os.execvp('pkexec', ['pkexec', sys.argv[0]] + env)
 
-# Restore whitelisted env vars passed through pkexec
+# Restore whitelisted env vars passed through pkexec (with validation)
 for a in sys.argv[1:]:
     if '=' in a:
         key, val = a.split('=', 1)
-        if key in ALLOWED_ENV:
+        validator = ENV_VALIDATORS.get(key)
+        if validator and validator.match(val):
             os.environ[key] = val
 
 # --- GTK imports (after privilege escalation) ---
@@ -99,17 +105,23 @@ class ZerotierGUI(Gtk.Application):
         self.has_nm = None           # NetworkManager available
         self.fw_type = None          # "firewalld", "ufw", or None
         self.busy = False
-        self._exec = ThreadPoolExecutor(max_workers=4)
+        self._action_busy = False    # True while a user-initiated action is running
+        self._sticky_error = False   # True when an error is shown that should persist
+        self._exec = ThreadPoolExecutor(max_workers=2)
         self.connect('activate', self.on_activate)
 
     def cmd(self, *args, timeout=CMD_TIMEOUT):
         """Run command with timeout, return stdout or empty string on failure."""
+        return self.cmd_rc(*args, timeout=timeout)[0]
+
+    def cmd_rc(self, *args, timeout=CMD_TIMEOUT):
+        """Run command with timeout, return (stdout, returncode).
+        Returns ('', -1) on timeout/missing binary/OS errors."""
         try:
-            return subprocess.run(
-                args, capture_output=True, text=True, timeout=timeout
-            ).stdout.strip()
+            r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+            return (r.stdout.strip(), r.returncode)
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return ''
+            return ('', -1)
 
     def dot(self, status):
         """Return colored status dot markup."""
@@ -118,6 +130,11 @@ class ZerotierGUI(Gtk.Application):
     def set_status(self, status, text):
         """Update status label with colored dot."""
         self.status.set_markup(f'{self.dot(status)} <b>Status:</b> {text}')
+
+    def set_error(self, status, text):
+        """Set a sticky error that persists until the next user action."""
+        self._sticky_error = True
+        self.set_status(status, text)
 
     def clear_box(self, box):
         """Remove all children from a Gtk.Box."""
@@ -166,15 +183,16 @@ class ZerotierGUI(Gtk.Application):
         try:
             content = open(DISPATCHER_PATH).read()
             return "255.255.255.255" in content, "firewall-cmd" in content or "ufw allow" in content
-        except (OSError, FileNotFoundError):
+        except OSError:
             return False, False
 
     def write_dispatcher(self, route, fw):
-        """Write or remove dispatcher script based on settings."""
+        """Write or remove dispatcher script based on settings.
+        Raises OSError on failure."""
         if not route and not fw:
             try:
                 os.remove(DISPATCHER_PATH)
-            except OSError:
+            except FileNotFoundError:
                 pass
             return
         
@@ -194,12 +212,9 @@ class ZerotierGUI(Gtk.Application):
             lines.append('ufw allow in on zt+ 2>/dev/null || true')
             lines.append('ufw allow out on zt+ 2>/dev/null || true')
 
-        try:
-            with open(DISPATCHER_PATH, 'w') as f:
-                f.write('\n'.join(lines) + '\n')
-            os.chmod(DISPATCHER_PATH, 0o755)
-        except OSError:
-            pass
+        with open(DISPATCHER_PATH, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        os.chmod(DISPATCHER_PATH, 0o755)
 
     # --- UI sensitivity control ---
     def set_busy(self, busy, status_text=None):
@@ -236,8 +251,16 @@ class ZerotierGUI(Gtk.Application):
         """Run function async if not busy. Returns True if started."""
         if self.busy:
             return False
+        self._action_busy = True
+        self._sticky_error = False
         self.set_busy(True, status_text)
-        self._exec.submit(lambda: (fn(), GLib.idle_add(self.refresh_async)))
+        def wrapper():
+            try:
+                fn()
+            finally:
+                self._action_busy = False
+                GLib.idle_add(self.refresh_async)
+        self._exec.submit(wrapper)
         return True
 
     # --- Toggle handlers (apply immediately + persist) ---
@@ -248,7 +271,11 @@ class ZerotierGUI(Gtk.Application):
         fw_active = self.firewall_check.get_active()
         
         def work():
-            self.write_dispatcher(active, self.fw_type if fw_active else None)
+            try:
+                self.write_dispatcher(active, self.fw_type if fw_active else None)
+            except OSError as e:
+                GLib.idle_add(self.set_error, "OFFLINE", f"dispatcher write failed: {e.strerror}")
+                return
             action = 'add' if active else 'del'
             for iface in self.get_zt_ifaces():
                 self.cmd('ip', 'route', action, '255.255.255.255/32', 'dev', iface)
@@ -262,20 +289,26 @@ class ZerotierGUI(Gtk.Application):
         route_active = self.route_check.get_active()
 
         def work():
-            self.write_dispatcher(route_active, self.fw_type if active else None)
+            try:
+                self.write_dispatcher(route_active, self.fw_type if active else None)
+            except OSError as e:
+                GLib.idle_add(self.set_error, "OFFLINE", f"dispatcher write failed: {e.strerror}")
+                return
             
             if self.fw_type == "firewalld":
                 for iface in self.get_zt_ifaces():
                     action = '--add-interface' if active else '--remove-interface'
-                    self.cmd('firewall-cmd', '--zone=trusted', f'{action}={iface}')
-                    
+                    _, rc = self.cmd_rc('firewall-cmd', '--zone=trusted', f'{action}={iface}')
+                    if rc != 0:
+                        GLib.idle_add(self.set_error, "WARN", "firewall-cmd failed")
+                        
             elif self.fw_type == "ufw":
                 if active:
-                    self.cmd('ufw', 'allow', 'in', 'on', 'zt+')
-                    self.cmd('ufw', 'allow', 'out', 'on', 'zt+')
+                    self.cmd_rc('ufw', 'allow', 'in', 'on', 'zt+')
+                    self.cmd_rc('ufw', 'allow', 'out', 'on', 'zt+')
                 else:
-                    self.cmd('ufw', 'delete', 'allow', 'in', 'on', 'zt+')
-                    self.cmd('ufw', 'delete', 'allow', 'out', 'on', 'zt+')
+                    self.cmd_rc('ufw', 'delete', 'allow', 'in', 'on', 'zt+')
+                    self.cmd_rc('ufw', 'delete', 'allow', 'out', 'on', 'zt+')
 
         self._run_async('updating firewall...', work)
 
@@ -283,18 +316,19 @@ class ZerotierGUI(Gtk.Application):
         if self.busy or not self.has_systemd:
             return
         action = 'enable' if check.get_active() else 'disable'
-        self._run_async('updating autostart...', lambda: self.cmd('systemctl', action, 'zerotier-one'))
+        self._run_async('updating autostart...',
+                        lambda: self.cmd_rc('systemctl', action, 'zerotier-one'))
 
     # --- Service and network actions ---
     def service_action(self, action):
         if self.busy or not self.has_systemd:
             return
-        
-        self.set_busy(True, {"stop":"stopping"}.get(action, f'{action}ing') + '...')
         expect_active = action in ('start', 'restart')
         
         def work():
-            self.cmd('systemctl', action, 'zerotier-one', timeout=15)
+            _, rc = self.cmd_rc('systemctl', action, 'zerotier-one', timeout=15)
+            if rc != 0:
+                GLib.idle_add(self.set_error, "OFFLINE", f"systemctl {action} failed (rc={rc})")
             # Poll until service reaches expected state (max 5 seconds)
             for _ in range(10):
                 time.sleep(0.5)
@@ -305,29 +339,34 @@ class ZerotierGUI(Gtk.Application):
                     break
                 if not expect_active and state in ('inactive', 'failed'):
                     break
-            GLib.idle_add(self.refresh_async)
         
-        self._exec.submit(work)
+        self._run_async({"stop":"stopping"}.get(action, f'{action}ing') + '...', work)
 
     def leave_network(self, nid, name):
         if self.busy:
             return
         
-        dlg = Gtk.MessageDialog(
-            transient_for=self.win, modal=True,
-            message_type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.YES_NO,
-            text=f"Leave {name}?"
-        )
+        dlg = Gtk.AlertDialog()
+        dlg.set_message(f"Leave {name}?")
+        dlg.set_detail(f"Network ID: {nid}")
+        dlg.set_buttons(["Leave", "Cancel"])
+        dlg.set_cancel_button(1)
+        dlg.set_default_button(1)
         
-        def on_response(d, response):
-            d.destroy()
-            if response == Gtk.ResponseType.YES:
-                self._run_async('leaving network...', 
-                    lambda: (self.cmd('zerotier-cli', 'leave', nid), time.sleep(0.2)))
+        def on_response(d, result):
+            try:
+                choice = d.choose_finish(result)
+            except GLib.Error:
+                return
+            if choice == 0:
+                def work():
+                    _, rc = self.cmd_rc('zerotier-cli', 'leave', nid)
+                    if rc != 0:
+                        GLib.idle_add(self.set_error, "WARN", f"failed to leave {name}")
+                    time.sleep(0.2)
+                self._run_async('leaving network...', work)
         
-        dlg.connect('response', on_response)
-        dlg.present()
+        dlg.choose(self.win, None, on_response)
 
     def join_network(self, entry):
         if self.busy:
@@ -336,12 +375,20 @@ class ZerotierGUI(Gtk.Application):
         
         # Validate 16-char hex network ID
         try:
-            valid = len(nid) == 16 and int(nid, 16) >= 0
+            valid = len(nid) == 16 and int(nid, 16) > 0
         except ValueError:
             valid = False
         
-        if valid and self._run_async('joining network...', 
-                lambda: (self.cmd('zerotier-cli', 'join', nid), time.sleep(0.2))):
+        if not valid:
+            return
+
+        def work():
+            _, rc = self.cmd_rc('zerotier-cli', 'join', nid)
+            if rc != 0:
+                GLib.idle_add(self.set_error, "WARN", f"failed to join network")
+            time.sleep(0.2)
+
+        if self._run_async('joining network...', work):
             entry.set_text('')
 
     # --- Async UI refresh ---
@@ -350,18 +397,16 @@ class ZerotierGUI(Gtk.Application):
         def worker():
             state, enabled, cli_online = self.get_service_info()
             
-            # Parallel fetch of networks and peers
-            nets_future = self._exec.submit(
-                lambda: self.cmd('zerotier-cli', 'listnetworks') if cli_online else '')
-            peers_future = self._exec.submit(
-                lambda: self.cmd('zerotier-cli', 'peers') if cli_online else '')
+            # Sequential fetch (avoids thread pool exhaustion from nested submissions)
+            networks = self.cmd('zerotier-cli', 'listnetworks') if cli_online else ''
+            peers = self.cmd('zerotier-cli', 'peers') if cli_online else ''
             
             data = {
                 'state': state,
                 'cli_online': cli_online,
                 'enabled': enabled,
-                'networks': nets_future.result(),
-                'peers': peers_future.result(),
+                'networks': networks,
+                'peers': peers,
             }
             GLib.idle_add(self._apply_refresh, data)
         
@@ -370,6 +415,10 @@ class ZerotierGUI(Gtk.Application):
 
     def _apply_refresh(self, data):
         """Apply refresh data to UI (must run on main thread)."""
+        # Don't clear busy state if a user action is still running
+        if self._action_busy:
+            return False
+
         self.busy = False
         self.spinner.stop()
         self.spinner.set_visible(False)
@@ -377,19 +426,20 @@ class ZerotierGUI(Gtk.Application):
         state = data['state']
         cli_online = data['cli_online']
         
-        # Update status display
-        if self.has_systemd is False:
-            self.set_status("WARN", "service not found")
-        elif state == 'failed':
-            self.set_status("OFFLINE", "failed")
-        elif state == 'active' and cli_online:
-            self.set_status("OK", "active")
-        elif state == 'active':
-            self.set_status("WARN", "starting...")
-        elif cli_online:
-            self.set_status("WARN", "active (unmanaged)")
-        else:
-            self.set_status("OFFLINE", "inactive")
+        # Update status display (skip if a sticky error is shown)
+        if not self._sticky_error:
+            if self.has_systemd is False:
+                self.set_status("WARN", "service not found")
+            elif state == 'failed':
+                self.set_status("OFFLINE", "failed")
+            elif state == 'active' and cli_online:
+                self.set_status("OK", "active")
+            elif state == 'active':
+                self.set_status("WARN", "starting...")
+            elif cli_online:
+                self.set_status("WARN", "active (unmanaged)")
+            else:
+                self.set_status("OFFLINE", "inactive")
         
         # Update control sensitivity based on capabilities and daemon state
         if self.has_systemd is not None:
@@ -416,7 +466,7 @@ class ZerotierGUI(Gtk.Application):
             for line in data['networks'].split('\n')[1:]:
                 p = line.split()
                 try:
-                    if len(p) >= 8 and len(p[2]) == 16 and int(p[2], 16) >= 0:
+                    if len(p) >= 8 and len(p[2]) == 16 and int(p[2], 16):
                         row = Gtk.Box(spacing=10)
                         
                         # Status dot
@@ -441,7 +491,10 @@ class ZerotierGUI(Gtk.Application):
                             row.append(cb)
                         
                         # Leave button
-                        lb = Gtk.Button(label="✕")
+                        lb = Gtk.Button()
+                        lb_label = Gtk.Label()
+                        lb_label.set_markup('<span foreground="#ff6b6b" weight="bold">✕</span>')
+                        lb.set_child(lb_label)
                         lb.set_tooltip_text("Leave network")
                         lb.connect('clicked', lambda _, n=p[2], nm=p[3]: self.leave_network(n, nm))
                         row.append(lb)
