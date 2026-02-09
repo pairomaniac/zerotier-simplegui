@@ -21,11 +21,9 @@ A lightweight GTK4 interface for managing ZeroTier networks on Linux, with some 
 
 ## Requirements
 
-- Linux with systemd (most desktop distros)
-- Python 3.8+
-- GTK4 with Python bindings
+- Linux desktop (systemd-based)
+- GTK4 (4.10+) with Python bindings
 - ZeroTier (zerotier-cli) installed and configured
-- PolicyKit (polkit) for privilege escalation
 - NetworkManager (optional, for dispatcher features)
 
 ## Installation
@@ -68,7 +66,7 @@ The installer will:
 ### Uninstall
 
 ```bash
-sudo ./zt-gui-installer.sh uninstall
+sudo ./zt-gui-installer.sh --uninstall
 ```
 
 ## Usage
@@ -120,7 +118,7 @@ Both settings persist across reboots via a NetworkManager dispatcher script.
 | `~/.local/bin/zerotier-gui` | Main application |
 | `~/.local/share/applications/zerotier-gui.desktop` | Desktop entry |
 | `~/.local/share/icons/hicolor/scalable/apps/zerotier-gui.svg` | Application icon |
-| `/etc/polkit-1/actions/com.local.zerotier-gui.policy` | PolicyKit policy |
+| `/etc/polkit-1/actions/com.local.zerotier-gui.policy` or `/usr/share/polkit-1/actions/com.local.zerotier-gui.policy` | PolicyKit policy |
 | `/etc/NetworkManager/dispatcher.d/99-zerotier-gaming` | Persistent settings (created when enabled) |
 
 ## Troubleshooting
