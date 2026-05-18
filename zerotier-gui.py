@@ -3,14 +3,17 @@
 import os
 import re
 import sys
+import json
 import subprocess
 import time
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DISPATCHER_PATH = "/etc/NetworkManager/dispatcher.d/99-zerotier-gaming"
 CMD_TIMEOUT = 5
+REFRESH_INTERVAL_S = 10
+THREAD_POOL_SIZE = 4
 
 # Validators for environment variables passed through pkexec (also serves as whitelist)
 ENV_VALIDATORS = {
@@ -40,7 +43,7 @@ Options:
   -h, --help      Show this help message
   -v, --version   Show version
 
-Requires root privileges (prompts via polkit) and zerotier-cli in PATH.""")
+Requires root privileges (prompts via polkit), GTK 4.10+, and zerotier-cli in PATH.""")
         sys.exit(0)
     elif arg in ('-v', '--version'):
         print(f"zerotier-gui {VERSION}")
@@ -97,6 +100,19 @@ import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib, Gdk
 
+# Set process/application name so window managers show "ZeroTier" instead of
+# "python3" (derived from argv[0] basename by default).
+GLib.set_prgname('zerotier-gui')
+GLib.set_application_name('ZeroTier')
+
+# Also set the kernel-level process name (visible in /proc/PID/comm, ps, and
+# used by some desktop environments for dock/taskbar entries). Max 15 chars.
+try:
+    import ctypes
+    ctypes.CDLL('libc.so.6').prctl(15, b'zerotier-gui', 0, 0, 0)  # PR_SET_NAME
+except (OSError, AttributeError):
+    pass
+
 
 class ZerotierGUI(Gtk.Application):
     def __init__(self):
@@ -104,24 +120,40 @@ class ZerotierGUI(Gtk.Application):
         self.has_systemd = None      # None = not yet checked
         self.has_nm = None           # NetworkManager available
         self.fw_type = None          # "firewalld", "ufw", or None
+        # Two independent flags:
+        #   busy            -> any background work running (controls spinner / control sensitivity)
+        #   action_running  -> a user-initiated action is in flight; prevents periodic refresh
+        #                      from clobbering its in-progress UI state
         self.busy = False
-        self._action_busy = False    # True while a user-initiated action is running
+        self.action_running = False
         self._sticky_error = False   # True when an error is shown that should persist
-        self._exec = ThreadPoolExecutor(max_workers=2)
+        self._exec = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
         self.connect('activate', self.on_activate)
 
     def cmd(self, *args, timeout=CMD_TIMEOUT):
-        """Run command with timeout, return stdout or empty string on failure."""
+        """Run command with timeout, return stdout (stripped) or '' on failure."""
         return self.cmd_rc(*args, timeout=timeout)[0]
 
     def cmd_rc(self, *args, timeout=CMD_TIMEOUT):
-        """Run command with timeout, return (stdout, returncode).
-        Returns ('', -1) on timeout/missing binary/OS errors."""
+        """Run command with timeout.
+        Returns (stdout, stderr, returncode). All strings are stripped.
+        Returns ('', '<reason>', -1) on timeout/missing binary/OS errors."""
         try:
             r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-            return (r.stdout.strip(), r.returncode)
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return ('', -1)
+            return (r.stdout.strip(), r.stderr.strip(), r.returncode)
+        except subprocess.TimeoutExpired:
+            return ('', f'timeout after {timeout}s', -1)
+        except FileNotFoundError:
+            return ('', f'command not found: {args[0]}', -1)
+        except OSError as e:
+            return ('', f'OS error: {e.strerror}', -1)
+
+    def err_msg(self, stderr, rc):
+        """Format a short error message from cmd_rc output."""
+        if stderr:
+            first = stderr.split('\n')[0]
+            return first[:80] + ('...' if len(first) > 80 else '')
+        return f'rc={rc}'
 
     def dot(self, status):
         """Return colored status dot markup."""
@@ -148,15 +180,36 @@ class ZerotierGUI(Gtk.Application):
         except OSError:
             return []
 
+    def get_iface_broadcast(self, iface):
+        """Get IPv4 broadcast address for an interface, or None."""
+        out = self.cmd('ip', '-j', '-4', 'addr', 'show', iface)
+        if not out:
+            return None
+        try:
+            data = json.loads(out)
+            for entry in data:
+                for ai in entry.get('addr_info', []):
+                    if ai.get('family') == 'inet' and ai.get('broadcast'):
+                        return ai['broadcast']
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        return None
+
     def get_service_info(self):
-        """Get service state and enabled status in one systemctl call.
+        """Get service state and ZT online status.
         Returns: (active_state, is_enabled, cli_online)
         """
-        cli_online = 'online' in self.cmd('zerotier-cli', 'info').lower()
-        
+        info = self.cmd('zerotier-cli', '-j', 'info')
+        cli_online = False
+        if info:
+            try:
+                cli_online = bool(json.loads(info).get('online', False))
+            except json.JSONDecodeError:
+                cli_online = 'online' in info.lower()  # fallback to text scan
+
         if not self.has_systemd:
             return ('unknown', False, cli_online)
-        
+
         out = self.cmd('systemctl', 'show', 'zerotier-one',
                        '--property=ActiveState,UnitFileState')
         state, enabled = 'unknown', False
@@ -181,7 +234,8 @@ class ZerotierGUI(Gtk.Application):
     def read_dispatcher(self):
         """Read current dispatcher script state. Returns (route_enabled, fw_enabled)."""
         try:
-            content = open(DISPATCHER_PATH).read()
+            with open(DISPATCHER_PATH) as f:
+                content = f.read()
             return "255.255.255.255" in content, "firewall-cmd" in content or "ufw allow" in content
         except OSError:
             return False, False
@@ -221,7 +275,7 @@ class ZerotierGUI(Gtk.Application):
         """Set busy state and grey out all interactive controls."""
         self.busy = busy
         sensitive = not busy
-        
+
         # Spinner
         self.spinner.set_visible(busy)
         if busy:
@@ -230,17 +284,18 @@ class ZerotierGUI(Gtk.Application):
                 self.set_status("WARN", status_text)
         else:
             self.spinner.stop()
-        
+
         # Service controls (only if capabilities known)
         if self.has_systemd is not None:
             for btn in self.service_btns:
                 btn.set_sensitive(sensitive and self.has_systemd)
             self.enable_check.set_sensitive(sensitive and self.has_systemd)
-        
+
         # Join controls - always disable when busy
         self.join_btn.set_sensitive(sensitive)
         self.join_entry.set_sensitive(sensitive)
-        
+        self.refresh_btn.set_sensitive(sensitive)
+
         # Dispatcher controls (only if capabilities known)
         if self.has_nm is not None:
             self.route_check.set_sensitive(sensitive and self.has_nm)
@@ -251,14 +306,14 @@ class ZerotierGUI(Gtk.Application):
         """Run function async if not busy. Returns True if started."""
         if self.busy:
             return False
-        self._action_busy = True
+        self.action_running = True
         self._sticky_error = False
         self.set_busy(True, status_text)
         def wrapper():
             try:
                 fn()
             finally:
-                self._action_busy = False
+                self.action_running = False
                 GLib.idle_add(self.refresh_async)
         self._exec.submit(wrapper)
         return True
@@ -269,17 +324,21 @@ class ZerotierGUI(Gtk.Application):
             return
         active = check.get_active()
         fw_active = self.firewall_check.get_active()
-        
+
         def work():
             try:
                 self.write_dispatcher(active, self.fw_type if fw_active else None)
             except OSError as e:
                 GLib.idle_add(self.set_error, "OFFLINE", f"dispatcher write failed: {e.strerror}")
                 return
-            action = 'add' if active else 'del'
             for iface in self.get_zt_ifaces():
-                self.cmd('ip', 'route', action, '255.255.255.255/32', 'dev', iface)
-        
+                if active:
+                    # replace = add-or-update, idempotent
+                    self.cmd_rc('ip', 'route', 'replace', '255.255.255.255/32', 'dev', iface)
+                else:
+                    # del may fail if route doesn't exist; ignore stderr
+                    self.cmd_rc('ip', 'route', 'del', '255.255.255.255/32', 'dev', iface)
+
         self._run_async('updating route...', work)
 
     def on_firewall_toggled(self, check):
@@ -294,14 +353,15 @@ class ZerotierGUI(Gtk.Application):
             except OSError as e:
                 GLib.idle_add(self.set_error, "OFFLINE", f"dispatcher write failed: {e.strerror}")
                 return
-            
+
             if self.fw_type == "firewalld":
                 for iface in self.get_zt_ifaces():
                     action = '--add-interface' if active else '--remove-interface'
-                    _, rc = self.cmd_rc('firewall-cmd', '--zone=trusted', f'{action}={iface}')
+                    _, stderr, rc = self.cmd_rc('firewall-cmd', '--zone=trusted', f'{action}={iface}')
                     if rc != 0:
-                        GLib.idle_add(self.set_error, "WARN", "firewall-cmd failed")
-                        
+                        GLib.idle_add(self.set_error, "WARN",
+                                      f"firewall-cmd: {self.err_msg(stderr, rc)}")
+
             elif self.fw_type == "ufw":
                 if active:
                     self.cmd_rc('ufw', 'allow', 'in', 'on', 'zt+')
@@ -316,19 +376,26 @@ class ZerotierGUI(Gtk.Application):
         if self.busy or not self.has_systemd:
             return
         action = 'enable' if check.get_active() else 'disable'
-        self._run_async('updating autostart...',
-                        lambda: self.cmd_rc('systemctl', action, 'zerotier-one'))
+
+        def work():
+            _, stderr, rc = self.cmd_rc('systemctl', action, 'zerotier-one')
+            if rc != 0:
+                GLib.idle_add(self.set_error, "WARN",
+                              f"systemctl {action}: {self.err_msg(stderr, rc)}")
+
+        self._run_async('updating autostart...', work)
 
     # --- Service and network actions ---
     def service_action(self, action):
         if self.busy or not self.has_systemd:
             return
         expect_active = action in ('start', 'restart')
-        
+
         def work():
-            _, rc = self.cmd_rc('systemctl', action, 'zerotier-one', timeout=15)
+            _, stderr, rc = self.cmd_rc('systemctl', action, 'zerotier-one', timeout=15)
             if rc != 0:
-                GLib.idle_add(self.set_error, "OFFLINE", f"systemctl {action} failed (rc={rc})")
+                GLib.idle_add(self.set_error, "OFFLINE",
+                              f"systemctl {action}: {self.err_msg(stderr, rc)}")
             # Poll until service reaches expected state (max 5 seconds)
             for _ in range(10):
                 time.sleep(0.5)
@@ -339,20 +406,34 @@ class ZerotierGUI(Gtk.Application):
                     break
                 if not expect_active and state in ('inactive', 'failed'):
                     break
-        
+
         self._run_async({"stop":"stopping"}.get(action, f'{action}ing') + '...', work)
+
+    def _wait_network_state(self, nid, want_present, max_wait_s=3.0):
+        """Poll listnetworks until the given network appears or disappears."""
+        deadline = time.monotonic() + max_wait_s
+        while time.monotonic() < deadline:
+            out = self.cmd('zerotier-cli', '-j', 'listnetworks')
+            try:
+                nwids = {n['nwid'] for n in json.loads(out)} if out else set()
+            except (json.JSONDecodeError, KeyError, TypeError):
+                nwids = set()
+            if want_present == (nid in nwids):
+                return True
+            time.sleep(0.2)
+        return False
 
     def leave_network(self, nid, name):
         if self.busy:
             return
-        
+
         dlg = Gtk.AlertDialog()
         dlg.set_message(f"Leave {name}?")
         dlg.set_detail(f"Network ID: {nid}")
         dlg.set_buttons(["Leave", "Cancel"])
         dlg.set_cancel_button(1)
         dlg.set_default_button(1)
-        
+
         def on_response(d, result):
             try:
                 choice = d.choose_finish(result)
@@ -360,47 +441,86 @@ class ZerotierGUI(Gtk.Application):
                 return
             if choice == 0:
                 def work():
-                    _, rc = self.cmd_rc('zerotier-cli', 'leave', nid)
+                    _, stderr, rc = self.cmd_rc('zerotier-cli', 'leave', nid)
                     if rc != 0:
-                        GLib.idle_add(self.set_error, "WARN", f"failed to leave {name}")
-                    time.sleep(0.2)
+                        GLib.idle_add(self.set_error, "WARN",
+                                      f"leave {name}: {self.err_msg(stderr, rc)}")
+                        return
+                    self._wait_network_state(nid, want_present=False)
                 self._run_async('leaving network...', work)
-        
+
         dlg.choose(self.win, None, on_response)
 
     def join_network(self, entry):
         if self.busy:
             return
         nid = entry.get_text().strip()
-        
+
         # Validate 16-char hex network ID
         try:
             valid = len(nid) == 16 and int(nid, 16) > 0
         except ValueError:
             valid = False
-        
+
         if not valid:
             return
 
         def work():
-            _, rc = self.cmd_rc('zerotier-cli', 'join', nid)
+            _, stderr, rc = self.cmd_rc('zerotier-cli', 'join', nid)
             if rc != 0:
-                GLib.idle_add(self.set_error, "WARN", f"failed to join network")
-            time.sleep(0.2)
+                GLib.idle_add(self.set_error, "WARN",
+                              f"join: {self.err_msg(stderr, rc)}")
+                return
+            self._wait_network_state(nid, want_present=True)
 
         if self._run_async('joining network...', work):
             entry.set_text('')
+
+    def warm_broadcast(self, _):
+        """Send a short broadcast ping burst on each ZT interface to refresh
+        multicast/broadcast subscriptions. Helps Wine/Proton games discover LAN
+        lobbies after the daemon has been restarted or sat idle.
+
+        Note: `ping -b` exits nonzero when no replies come back, which is the
+        normal case (Linux ignores broadcast pings by default via
+        net.ipv4.icmp_echo_ignore_broadcasts=1). The packets still go out and
+        warm the interface, so we intentionally ignore the return code."""
+        if self.busy:
+            return
+
+        def work():
+            warmed = []
+            for iface in self.get_zt_ifaces():
+                bcast = self.get_iface_broadcast(iface)
+                if not bcast:
+                    continue
+                self.cmd_rc('ping', '-b', '-c', '5', '-i', '0.2', '-W', '1',
+                            '-I', iface, bcast, timeout=5)
+                warmed.append(iface)
+            if not warmed:
+                GLib.idle_add(self.set_error, "WARN", "no ZT interfaces to warm")
+
+        self._run_async('warming broadcast...', work)
 
     # --- Async UI refresh ---
     def refresh_async(self):
         """Start async refresh - gathers data in background thread."""
         def worker():
             state, enabled, cli_online = self.get_service_info()
-            
-            # Sequential fetch (avoids thread pool exhaustion from nested submissions)
-            networks = self.cmd('zerotier-cli', 'listnetworks') if cli_online else ''
-            peers = self.cmd('zerotier-cli', 'peers') if cli_online else ''
-            
+
+            # Sequential JSON fetch
+            networks_json = self.cmd('zerotier-cli', '-j', 'listnetworks') if cli_online else ''
+            peers_json = self.cmd('zerotier-cli', '-j', 'peers') if cli_online else ''
+
+            try:
+                networks = json.loads(networks_json) if networks_json else []
+            except json.JSONDecodeError:
+                networks = []
+            try:
+                peers = json.loads(peers_json) if peers_json else []
+            except json.JSONDecodeError:
+                peers = []
+
             data = {
                 'state': state,
                 'cli_online': cli_online,
@@ -409,23 +529,33 @@ class ZerotierGUI(Gtk.Application):
                 'peers': peers,
             }
             GLib.idle_add(self._apply_refresh, data)
-        
+
         self._exec.submit(worker)
         return False
+
+    @staticmethod
+    def _pick_ipv4(addresses):
+        """Pick the first IPv4 address from a list of CIDR strings.
+        Returns (display_without_mask, full_with_mask) or ('', '')."""
+        for a in addresses or []:
+            ip = a.split('/')[0]
+            if ':' not in ip and ip.count('.') == 3:
+                return ip, a
+        return '', ''
 
     def _apply_refresh(self, data):
         """Apply refresh data to UI (must run on main thread)."""
         # Don't clear busy state if a user action is still running
-        if self._action_busy:
+        if self.action_running:
             return False
 
         self.busy = False
         self.spinner.stop()
         self.spinner.set_visible(False)
-        
+
         state = data['state']
         cli_online = data['cli_online']
-        
+
         # Update status display (skip if a sticky error is shown)
         if not self._sticky_error:
             if self.has_systemd is False:
@@ -440,89 +570,108 @@ class ZerotierGUI(Gtk.Application):
                 self.set_status("WARN", "active (unmanaged)")
             else:
                 self.set_status("OFFLINE", "inactive")
-        
+
         # Update control sensitivity based on capabilities and daemon state
         if self.has_systemd is not None:
             for btn in self.service_btns:
                 btn.set_sensitive(self.has_systemd)
             self.enable_check.set_sensitive(self.has_systemd)
-        
+
         self.join_entry.set_sensitive(cli_online)
         self.join_btn.set_sensitive(cli_online)
-        
+        self.refresh_btn.set_sensitive(True)
+
         if self.has_nm is not None:
             self.route_check.set_sensitive(self.has_nm)
         self.firewall_check.set_sensitive(self.fw_type is not None)
-        
+
         # Update enable checkbox without triggering handler
         if self.has_systemd:
             self.enable_check.handler_block(self._enable_hid)
             self.enable_check.set_active(data['enabled'])
             self.enable_check.handler_unblock(self._enable_hid)
-        
+
         # Rebuild network list
         self.clear_box(self.nets)
         if cli_online:
-            for line in data['networks'].split('\n')[1:]:
-                p = line.split()
-                try:
-                    if len(p) >= 8 and len(p[2]) == 16 and int(p[2], 16):
-                        row = Gtk.Box(spacing=10)
-                        
-                        # Status dot
-                        lbl = Gtk.Label(xalign=0)
-                        lbl.set_markup(self.dot(p[5]))
-                        lbl.set_tooltip_text(p[5])
-                        row.append(lbl)
-                        
-                        # Network name
-                        row.append(Gtk.Label(label=p[3], xalign=0, hexpand=True))
-                        
-                        # IP address
-                        ip = p[8] if len(p) > 8 else ''
-                        row.append(Gtk.Label(label=ip))
-                        
-                        # Copy button
-                        if ip:
-                            cb = Gtk.Button(label="📋")
-                            cb.set_tooltip_text("Copy IP")
-                            cb.connect('clicked', lambda _, t=ip.split('/')[0]:
-                                Gdk.Display.get_default().get_clipboard().set(t))
-                            row.append(cb)
-                        
-                        # Leave button
-                        lb = Gtk.Button()
-                        lb_label = Gtk.Label()
-                        lb_label.set_markup('<span foreground="#ff6b6b" weight="bold">✕</span>')
-                        lb.set_child(lb_label)
-                        lb.set_tooltip_text("Leave network")
-                        lb.connect('clicked', lambda _, n=p[2], nm=p[3]: self.leave_network(n, nm))
-                        row.append(lb)
-                        
-                        self.nets.append(row)
-                except ValueError:
-                    pass
-        
+            for net in data['networks']:
+                nwid = net.get('nwid', '')
+                name = net.get('name') or '(unnamed)'
+                status = net.get('status', 'UNKNOWN')
+
+                if len(nwid) != 16:
+                    continue
+
+                row = Gtk.Box(spacing=10)
+
+                # Status dot
+                lbl = Gtk.Label(xalign=0)
+                lbl.set_markup(self.dot(status))
+                lbl.set_tooltip_text(status)
+                row.append(lbl)
+
+                # Network name with network ID in small monospace below
+                name_label = Gtk.Label(xalign=0, hexpand=True)
+                name_label.set_markup(
+                    f'{GLib.markup_escape_text(name)}\n'
+                    f'<small><tt>{GLib.markup_escape_text(nwid)}</tt></small>')
+                row.append(name_label)
+
+                # IP address (prefer IPv4, strip CIDR mask for display)
+                ip_plain, _ = self._pick_ipv4(net.get('assignedAddresses', []))
+                row.append(Gtk.Label(label=ip_plain))
+
+                # Copy Network ID button
+                idb = Gtk.Button(label="🆔")
+                idb.set_tooltip_text(f"Copy Network ID ({nwid})")
+                idb.connect('clicked', lambda _, t=nwid:
+                    Gdk.Display.get_default().get_clipboard().set(t))
+                row.append(idb)
+
+                # Copy IP button
+                if ip_plain:
+                    cb = Gtk.Button(label="📋")
+                    cb.set_tooltip_text("Copy IP")
+                    cb.connect('clicked', lambda _, t=ip_plain:
+                        Gdk.Display.get_default().get_clipboard().set(t))
+                    row.append(cb)
+
+                # Leave button
+                lb = Gtk.Button()
+                lb_label = Gtk.Label()
+                lb_label.set_markup('<span foreground="#ff6b6b" weight="bold">✕</span>')
+                lb.set_child(lb_label)
+                lb.set_tooltip_text("Leave network")
+                lb.connect('clicked', lambda _, n=nwid, nm=name: self.leave_network(n, nm))
+                row.append(lb)
+
+                self.nets.append(row)
+
         if not self.nets.get_first_child():
             self.nets.append(Gtk.Label(label="No networks", xalign=0))
-        
+
         # Rebuild peer list
         self.clear_box(self.peers)
         if cli_online:
-            for line in data['peers'].split('\n')[1:]:
-                p = line.split()
-                if len(p) >= 6 and p[2] == 'LEAF' and p[3] != '-1':
-                    row = Gtk.Box(spacing=10)
-                    lbl = Gtk.Label(xalign=0)
-                    lbl.set_markup(self.dot("OK"))
-                    row.append(lbl)
-                    row.append(Gtk.Label(label=p[0][:10] + '...', xalign=0, hexpand=True))
-                    row.append(Gtk.Label(label=p[3] + 'ms'))
-                    self.peers.append(row)
-        
+            for peer in data['peers']:
+                if peer.get('role') != 'LEAF':
+                    continue
+                latency = peer.get('latency', -1)
+                if latency is None or latency < 0:
+                    continue
+                addr = peer.get('address', '')
+
+                row = Gtk.Box(spacing=10)
+                lbl = Gtk.Label(xalign=0)
+                lbl.set_markup(self.dot("OK"))
+                row.append(lbl)
+                row.append(Gtk.Label(label=addr, xalign=0, hexpand=True))
+                row.append(Gtk.Label(label=f'{latency}ms'))
+                self.peers.append(row)
+
         if not self.peers.get_first_child():
             self.peers.append(Gtk.Label(label="No peers connected", xalign=0))
-        
+
         return False
 
     def _init_capabilities(self):
@@ -585,18 +734,23 @@ class ZerotierGUI(Gtk.Application):
         box.set_margin_start(15)
         box.set_margin_end(15)
         
-        # Status row with spinner
+        # Status row with spinner and refresh button
         status_row = Gtk.Box(spacing=8)
         self.status = Gtk.Label(xalign=0, hexpand=True)
         self.spinner = Gtk.Spinner()
         self.spinner.set_visible(False)
+        self.refresh_btn = Gtk.Button(label="↻")
+        self.refresh_btn.set_tooltip_text("Refresh now")
+        self.refresh_btn.set_sensitive(False)
+        self.refresh_btn.connect('clicked', lambda _: self.refresh_async() if not self.busy else None)
         status_row.append(self.status)
         status_row.append(self.spinner)
-        
+        status_row.append(self.refresh_btn)
+
         # Network and peer containers
         self.nets = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         self.peers = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        
+
         for w in [status_row, Gtk.Label(label="Networks", xalign=0), Gtk.Separator(), self.nets]:
             box.append(w)
         
@@ -646,6 +800,12 @@ class ZerotierGUI(Gtk.Application):
             "Allows all traffic on ZeroTier interfaces. Applies to all ZeroTier networks.")
         self.firewall_check.connect('toggled', self.on_firewall_toggled)
         box.append(self.firewall_check)
+
+        # Manual broadcast warmup (one-shot)
+        self.warm_btn = Gtk.Button(label="Warm broadcast")
+        self.warm_btn.set_tooltip_text("Refresh broadcast on ZeroTier interfaces")
+        self.warm_btn.connect('clicked', self.warm_broadcast)
+        box.append(self.warm_btn)
         
         self.win.set_child(box)
         self.win.present()
@@ -657,7 +817,7 @@ class ZerotierGUI(Gtk.Application):
         
         # Detect capabilities async, then refresh
         self._exec.submit(self._init_capabilities)
-        GLib.timeout_add(5000, self._periodic_refresh)
+        GLib.timeout_add(REFRESH_INTERVAL_S * 1000, self._periodic_refresh)
 
 
 # --- Entry point ---
