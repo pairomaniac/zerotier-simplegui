@@ -52,7 +52,7 @@ sudo pacman -S python-gobject gtk4 zerotier-one
 
 ```bash
 # Clone or download the repository
-git clone https://github.com/pairomaniac/zerotier-gui.git
+git clone https://github.com/pairomaniac/zerotier-simplegui.git
 cd zerotier-gui
 
 # Run the installer (must use sudo as a regular user)
