@@ -2,7 +2,7 @@
 # ZeroTier GUI Installer - installs zerotier-gui.py with polkit integration
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON_SRC="$SCRIPT_DIR/zerotier-gui.py"
 
@@ -40,7 +40,8 @@ USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
 
 # --- Paths ---
 INSTALL_PATH="$USER_HOME/.local/bin/zerotier-gui"
-DESKTOP_PATH="$USER_HOME/.local/share/applications/zerotier-gui.desktop"
+DESKTOP_PATH="$USER_HOME/.local/share/applications/com.local.zerotier-gui.desktop"
+DESKTOP_PATH_LEGACY="$USER_HOME/.local/share/applications/zerotier-gui.desktop"
 ICON_PATH="$USER_HOME/.local/share/icons/hicolor/scalable/apps/zerotier-gui.svg"
 DISPATCHER_PATH="/etc/NetworkManager/dispatcher.d/99-zerotier-gaming"
 
@@ -93,7 +94,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     echo "Uninstalling ZeroTier GUI..."
     echo ""
     
-    for f in "$INSTALL_PATH" "$DESKTOP_PATH" "$ICON_PATH" "$DISPATCHER_PATH"; do
+    for f in "$INSTALL_PATH" "$DESKTOP_PATH" "$DESKTOP_PATH_LEGACY" "$ICON_PATH" "$DISPATCHER_PATH"; do
         if [[ -f "$f" ]]; then
             rm -f "$f"
             echo "  [x] $f"
@@ -213,8 +214,15 @@ Icon=zerotier-gui
 Terminal=false
 Type=Application
 Categories=Network;
+StartupWMClass=zerotier-gui
 EOF
 chown "$SUDO_USER:$SUDO_USER" "$DESKTOP_PATH"
+
+# Remove legacy desktop file from earlier versions to avoid duplicate dock entries
+if [[ -f "$DESKTOP_PATH_LEGACY" ]]; then
+    rm -f "$DESKTOP_PATH_LEGACY"
+    echo "  [x] $DESKTOP_PATH_LEGACY (legacy, removed)"
+fi
 
 # --- Refresh system caches ---
 echo ""
