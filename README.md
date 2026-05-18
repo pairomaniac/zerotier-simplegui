@@ -2,7 +2,8 @@
 
 A lightweight GTK4 interface for managing ZeroTier networks on Linux, with some gaming-focused niceties and a minimalistic look.
 
-<img width="307" height="367" alt="zt-gaming" src="https://github.com/user-attachments/assets/3a9f6b17-b62e-4777-9d79-ae85648f0b51" />
+<img width="350" height="462" alt="Screenshot_20260518_224806" src="https://github.com/user-attachments/assets/9b7890eb-ffb4-4130-8582-c1dbccec5b7c" />
+
 
 ## Features
 
@@ -11,10 +12,12 @@ A lightweight GTK4 interface for managing ZeroTier networks on Linux, with some 
 - Monitor connected peers with latency
 - Start/stop/restart the ZeroTier service
 - Enable/disable service autostart
-- Copy network IP addresses to clipboard
+- Copy network IDs and IP addresses to clipboard
+- Manual refresh button
 - **Gaming optimizations:**
   - Broadcast route for LAN game discovery (255.255.255.255/32)
   - Automatic firewall zone configuration (firewalld/ufw)
+  - Warm broadcast button to refresh broadcast on ZeroTier interfaces (helps Wine/Proton LAN discovery)
 - Persistent settings via NetworkManager dispatcher
 - Automatic theme detection (supports dark mode)
 - Wayland and X11 support
@@ -103,6 +106,10 @@ Automatically configures your firewall to allow all traffic on ZeroTier interfac
 
 Both settings persist across reboots via a NetworkManager dispatcher script.
 
+### Warm Broadcast
+
+One-shot button that sends a brief broadcast ping burst on each ZeroTier interface. Useful before launching Wine/Proton LAN games when broadcast-based game discovery isn't working — the interface activity refreshes broadcast/multicast subscriptions on the ZeroTier side, which Wine sometimes fails to register on its own.
+
 ## How It Works
 
 1. The application runs as root via `pkexec` (PolicyKit)
@@ -116,7 +123,7 @@ Both settings persist across reboots via a NetworkManager dispatcher script.
 | File | Purpose |
 |------|---------|
 | `~/.local/bin/zerotier-gui` | Main application |
-| `~/.local/share/applications/zerotier-gui.desktop` | Desktop entry |
+| `~/.local/share/applications/com.local.zerotier-gui.desktop` | Desktop entry |
 | `~/.local/share/icons/hicolor/scalable/apps/zerotier-gui.svg` | Application icon |
 | `/etc/polkit-1/actions/com.local.zerotier-gui.policy` or `/usr/share/polkit-1/actions/com.local.zerotier-gui.policy` | PolicyKit policy |
 | `/etc/NetworkManager/dispatcher.d/99-zerotier-gaming` | Persistent settings (created when enabled) |
